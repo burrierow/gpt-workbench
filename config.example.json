@@ -1,0 +1,47 @@
+{
+  "dataDir": "C:/path/to/gpt-workbench/data",
+  "codexExe": "C:/path/to/codex.exe",
+  "taskTimeoutMinutes": 90,
+  "kimiTaskRoot": "",
+  "historySectionId": "",
+  "workbuddy": {
+    "exe": "C:\\Program Files\\WorkBuddy\\WorkBuddy.exe",
+    "cli": "C:\\Program Files\\WorkBuddy\\resources\\app.asar.unpacked\\cli\\dist\\codebuddy-lite-wb.mjs",
+    "gitBash": "C:\\Program Files\\WorkBuddy\\resources\\vendor\\PortableGit\\bin\\bash.exe"
+  },
+  "clash": {
+    "exe": "C:\\Program Files\\Clash Verge\\clash-verge.exe",
+    "profile": "C:/path/to/clash-verge.yaml",
+    "group": "🧲 AI",
+    "probeUrl": "https://chatgpt.com/backend-api/wham/accounts/check",
+    "probeStatus": 401,
+    "slowMs": 2000,
+    "minGainMs": 120,
+    "regions": {
+      "US": "美国|美國|🇺🇸|\\b(?:US|USA)\\b",
+      "JP": "日本|🇯🇵|\\bJP\\b",
+      "SG": "新加坡|狮城|獅城|🇸🇬|\\bSG\\b",
+      "KR": "韩国|韓國|🇰🇷|\\bKR\\b",
+      "GB": "英国|英國|🇬🇧|\\b(?:UK|GB)\\b",
+      "DE": "德国|德國|🇩🇪|\\bDE\\b",
+      "CA": "加拿大|🇨🇦|\\bCA\\b",
+      "AU": "澳大利亚|澳洲|🇦🇺|\\bAU\\b",
+      "FR": "法国|法國|🇫🇷|\\bFR\\b",
+      "NL": "荷兰|荷蘭|🇳🇱|\\bNL\\b",
+      "HK": "香港|🇭🇰|\\bHK\\b",
+      "TW": "台湾|台灣|🇹🇼|\\bTW\\b"
+    },
+    "candidateRegions": [
+      "US",
+      "JP",
+      "SG",
+      "KR",
+      "GB",
+      "DE",
+      "CA",
+      "AU",
+      "FR",
+      "NL"
+    ]
+  }
+}
