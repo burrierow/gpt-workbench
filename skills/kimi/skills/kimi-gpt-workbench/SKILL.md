@@ -17,6 +17,8 @@ description: 用GPT。识别 Kimi Work 任务的固定触发语「用GPT」，�
 4. `completed` 时直接回复 `text` 和可点击的附件，用 `deliveryArtifacts` 提供的本会话目录路径，未提供时用 `artifacts`。支持链接时附 `chatLink`。任务失败或中断时回传 `error` 和已有会话链接。重新打开会话后用同一 ID 调用 `follow` 就能取回终态。
 5. 在同一条终态回复使用 `follow` 返回的额度，按「GPT（Codex）剩余额度 · 5 小时 X% · 一周 Y%」显示 `quota.fiveHourRemainingPercent` 和 `quota.weeklyRemainingPercent`。null 显示「暂无法读取」，0 显示 0%。
 
+回传后，用 `delivery-report --id ID --source kimi --state submitted` 记录渠道已明确受理文字和应交附件。用户确认收到后，上报 `--state confirmed`。附件准备（`deliveryError`）或回传失败时，把原因写入 UTF-8 文本并用 `--state failed --reply-file "原因文件"` 上报。无法核实渠道是否受理时保持 `pending`。补发时在原会话用同一 ID 调用 `follow`，回传用户还没收到的文字和文件，优先使用本次返回的 `deliveryArtifacts`。已确认收到的任务仅在用户要求时补发。
+
 回报任务 ID 与 `execution` 中的状态、实际会话模式、是否运行、模型、推理强度。模型和强度为 null 时说「未上报」。心跳表示工作台在线，`execution.running` 为 true 才能确认 Codex 正在执行。收到 `routingNote` 时同时告知请求模式。
 
 用最新的 `execution.status` 说明当前阶段。`starting_gpt` 表示会话正在启动，`running` 表示已开工。

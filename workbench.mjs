@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, watch } from 'node:fs';
-import { cp, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -51,6 +52,14 @@ const phaseLabels = {
 const connectionError = /stream disconnected|connection (?:reset|refused|closed|timed out)|websocket.{0,70}(?:error|failed|timeout|disconnect)|network error|failed to (?:connect|send request)|error sending request|ECONN(?:RESET|REFUSED)|ETIMEDOUT/i;
 const workspaceRoutingTimeout = /\bworkspace routing discovery timed out\b/i;
 const startupMethods = new Set(['initialize', 'account/read', 'thread/start']);
+const startupObservedMethods = new Set([...startupMethods, 'turn/start']);
+const startupLabels = {
+  initialize: '初始化 Codex',
+  'account/read': '检查 ChatGPT 登录',
+  'thread/start': '创建 Codex 会话',
+  'turn/start': '等待 Codex 确认开工',
+};
+const receiptStates = ['submitted', 'failed', 'confirmed'];
 const startupRetryable = (error) => workspaceRoutingTimeout.test(errorText(error))
   || connectionError.test(errorText(error)) || /^Codex 请求超时 /.test(errorText(error));
 
@@ -107,7 +116,9 @@ function taskFeedback(status) {
   const result = {
     ...status,
     execution: {
-      status: phaseLabels[state] ?? state,
+      status: state === 'starting_gpt' && status.startupStep?.state === 'running'
+        ? startupLabels[status.startupStep.method] ?? phaseLabels[state]
+        : phaseLabels[state] ?? state,
       sessionMode: sessionMode(mode),
       requestedSessionMode: sessionMode(status.requestedMode ?? mode),
       running: state === 'running_work' || state === 'missing' ? null
@@ -214,6 +225,7 @@ function taskSelection(prompt, options = {}) {
 }
 
 function statusPath(id) { return join(taskDir(id), 'status.json'); }
+function resultPath(id) { return join(taskDir(id), 'result.json'); }
 function peerPath(id) { return join(taskDir(id), 'peer.json'); }
 function knowledgeDir(provider, id) { return join(kb, known(provider, providers), validId(id)); }
 
@@ -264,51 +276,91 @@ async function stageKimiArtifacts(id, artifacts) {
     if (!isInside(source, file)) throw new Error('任务产物路径超出产物目录');
     return relative(source, file);
   });
-  if (!existsSync(output)) {
-    const physicalSource = await realpath(source);
-    if (relative(await realpath(taskDir(id)), physicalSource) !== join('workspace', 'artifacts')) {
-      throw new Error('任务产物目录无效');
-    }
-    const stagingDir = await mkdtemp(join(cwd, '.gpt-results-'));
-    try {
-      for (const path of paths) {
-        const input = join(source, path);
-        if (!(await lstat(input)).isFile() || !isInside(physicalSource, await realpath(input))) {
-          throw new Error('任务产物需要是目录内的普通文件');
-        }
-        const destination = join(stagingDir, path);
-        await mkdir(dirname(destination), { recursive: true });
-        await cp(input, destination, { force: false, errorOnExist: true });
+  async function deliveryFiles(directory) {
+    const physicalOutput = await realpath(directory);
+    if (relative(directory, physicalOutput)) throw new Error('Kimi 交付目录无效');
+    return Promise.all(paths.map(async (path) => {
+      const file = join(directory, path);
+      if (!(await lstat(file)).isFile() || !isInside(physicalOutput, await realpath(file))) {
+        throw new Error('Kimi 交付文件不完整');
       }
-      try { await rename(stagingDir, output); } catch (error) {
-        if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(error.code) || !existsSync(output)) throw error;
+      return file;
+    }));
+  }
+  let destination = output;
+  if (existsSync(output)) {
+    try { return { deliveryArtifacts: await deliveryFiles(output) }; }
+    catch {
+      destination = output + '-retry';
+      if (existsSync(destination)) {
+        try { return { deliveryArtifacts: await deliveryFiles(destination) }; }
+        catch { destination = output + '-' + randomUUID(); }
       }
-    } finally {
-      if (isInside(cwd, stagingDir)) await rm(stagingDir, { recursive: true, force: true });
     }
   }
-  const physicalOutput = await realpath(output);
-  if (relative(output, physicalOutput)) throw new Error('Kimi 交付目录无效');
-  const deliveryArtifacts = await Promise.all(paths.map(async (path) => {
-    const file = join(output, path);
-    if (!(await lstat(file)).isFile() || !isInside(physicalOutput, await realpath(file))) {
-      throw new Error('Kimi 交付文件不完整');
+  const physicalSource = await realpath(source);
+  if (relative(await realpath(taskDir(id)), physicalSource) !== join('workspace', 'artifacts')) {
+    throw new Error('任务产物目录无效');
+  }
+  const stagingDir = await mkdtemp(join(cwd, '.gpt-results-'));
+  try {
+    for (const path of paths) {
+      const input = join(source, path);
+      if (!(await lstat(input)).isFile() || !isInside(physicalSource, await realpath(input))) {
+        throw new Error('任务产物需要是目录内的普通文件');
+      }
+      const stagedFile = join(stagingDir, path);
+      await mkdir(dirname(stagedFile), { recursive: true });
+      await cp(input, stagedFile, { force: false, errorOnExist: true });
     }
-    return file;
-  }));
-  return { deliveryArtifacts };
+    try { await rename(stagingDir, destination); } catch (error) {
+      if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(error.code) || !existsSync(destination)) throw error;
+    }
+  } finally {
+    if (isInside(cwd, stagingDir)) await rm(stagingDir, { recursive: true, force: true });
+  }
+  return { deliveryArtifacts: await deliveryFiles(destination) };
 }
 
 async function followJob(id, seconds) {
   const status = await waitForJob(id, seconds);
   if (!providers.includes(status.source) || !terminal.includes(status.state)) return status;
-  const [quota, delivery] = await Promise.all([
+  const [quota, staged, withReceipt] = await Promise.all([
     Object.hasOwn(status, 'quota') ? status.quota : currentQuota(),
     status.source === 'kimi' && status.state === 'completed'
       ? stageKimiArtifacts(id, status.artifacts).catch((error) => ({ deliveryError: errorText(error) }))
       : {},
+    withDeliveryReceipt(status),
   ]);
-  return { ...status, quota, ...delivery };
+  return { ...withReceipt, quota, ...staged };
+}
+
+function receiptPath(id, state) {
+  return join(taskDir(id), 'delivery-' + state + '.json');
+}
+
+async function withDeliveryReceipt(status) {
+  if (status.state !== 'completed' || !providers.includes(status.source)) return status;
+  const [submitted, failed, confirmed] = await Promise.all(
+    receiptStates.map((state) => optional(receiptPath(status.id, state))),
+  );
+  const latest = failed && (!submitted || failed.reportedAt > submitted.reportedAt) ? failed : submitted;
+  return { ...status, delivery: confirmed ?? latest ?? { state: 'pending' } };
+}
+
+async function reportDelivery(id, source, state, detailFile) {
+  known(source, providers);
+  known(state, receiptStates);
+  const status = await read(statusPath(id));
+  if (status.state !== 'completed' || status.source !== source) {
+    throw new Error('需要由原派单渠道回报已完成任务的交付');
+  }
+  if (state === 'failed' && !detailFile) throw new Error('回报交付失败时请提供失败原因');
+  const detail = detailFile ? (await loadText(detailFile)).slice(0, 1000) : undefined;
+  await save(receiptPath(id, state), {
+    state, source, reportedAt: stamp(), ...(detail ? { detail } : {}),
+  });
+  emit(taskFeedback(await withDeliveryReceipt(status)));
 }
 
 async function askKnowledge(provider, jobId, file, seconds) {
@@ -422,21 +474,57 @@ async function finishWork(id, file, chatLink) {
   emit({ id, state: 'work_result_submitted' });
 }
 
-async function serve() {
+async function acquireListener() {
   const lockPath = join(data, 'listener.lock');
-  let lock;
-  try { lock = await open(lockPath, 'wx'); } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    const previous = await optional(lockPath).catch(() => null);
-    if (!Number.isInteger(previous?.pid)) throw new Error('监听器正启动，或 listener.lock 已损坏');
-    try { process.kill(previous.pid, 0); } catch (probe) {
-      if (probe.code !== 'ESRCH') throw probe;
-      await rm(lockPath);
-      lock = await open(lockPath, 'wx');
+  const physicalPath = await realpath(data);
+  const key = createHash('sha256').update(
+    process.platform === 'win32' ? physicalPath.toLowerCase() : physicalPath,
+  ).digest('hex').slice(0, 32);
+  const endpoint = (process.platform === 'win32' ? '\\\\.\\pipe\\' : '\0') + 'gpt-workbench-' + key;
+  const gate = createServer((socket) => socket.destroy());
+  await new Promise((resolveGate, rejectGate) => {
+    gate.once('error', rejectGate);
+    gate.listen(endpoint, () => {
+      gate.off('error', rejectGate);
+      resolveGate();
+    });
+  }).catch((error) => {
+    if (error.code === 'EADDRINUSE') throw new Error('工作台监听器已运行');
+    throw error;
+  });
+  try {
+    let previous = await optional(lockPath).catch((error) => {
+      if (!(error instanceof SyntaxError)) throw error;
+    });
+    // Give a legacy listener time to write its PID if it just created the file.
+    if (!previous && existsSync(lockPath)) {
+      const age = Date.now() - (await lstat(lockPath)).mtimeMs;
+      if (age < 1000) await sleep(1000 - Math.max(age, 0));
+      previous = await optional(lockPath).catch((error) => {
+        if (!(error instanceof SyntaxError)) throw error;
+      });
     }
-    if (!lock) throw new Error('工作台监听器已运行');
+    if (previous?.ownership !== 'socket' && Number.isInteger(previous?.pid) && previous.pid > 0) {
+      let running = true;
+      try { process.kill(previous.pid, 0); } catch (error) {
+        if (error.code === 'ESRCH') running = false;
+        else if (error.code !== 'EPERM') throw error;
+      }
+      if (running) throw new Error('工作台监听器已运行');
+    }
+    await save(lockPath, { pid: process.pid, startedAt: stamp(), ownership: 'socket' });
+    return async () => {
+      try { await rm(lockPath, { force: true }); }
+      finally { gate.close(); }
+    };
+  } catch (error) {
+    gate.close();
+    throw error;
   }
-  await lock.writeFile(JSON.stringify({ pid: process.pid, startedAt: stamp() }));
+}
+
+async function serve() {
+  const releaseListener = await acquireListener();
   const clash = new Clash(config.clash);
   const recovery = new WorkBuddyRecovery(config.workbuddy, join(data, 'workbuddy-recovery'));
   const states = new Map();
@@ -532,9 +620,39 @@ async function serve() {
 
   async function deliver(id, payload) {
     const artifacts = await files(join(taskDir(id), 'workspace', 'artifacts'));
-    const result = { ...payload, artifacts };
-    await save(join(taskDir(id), 'result.json'), result);
-    await update(id, { ...result, state: 'completed', completedAt: stamp() }, true);
+    const result = { ...payload, artifacts, completedAt: stamp() };
+    await save(resultPath(id), result);
+    await update(id, { ...result, state: 'completed' }, true);
+  }
+
+  async function restoreJob(id) {
+    const status = await optional(statusPath(id));
+    if (status?.state === 'completed') return;
+
+    const result = await optional(resultPath(id)).catch((error) => {
+      if (!(error instanceof SyntaxError)) throw error;
+      report(error);
+    });
+    if (result && typeof result.text === 'string' && Array.isArray(result.artifacts)) {
+      const job = status ?? await read(join(taskDir(id), 'task.json'));
+      states.set(id, status ?? { id, source: job.source, ...taskRoute(job) });
+      const completedAt = result.completedAt ?? (await lstat(resultPath(id))).mtime.toISOString();
+      await update(id, { ...result, completedAt, state: 'completed', error: undefined }, true);
+      return;
+    }
+
+    if (!status) {
+      const job = await read(join(taskDir(id), 'task.json'));
+      startJob(job, { id, source: job.source, ...taskRoute(job) });
+      return;
+    }
+    if (terminal.includes(status.state)) return;
+    states.set(id, status);
+    if (['queued', 'preparing_network', 'waiting_network', 'starting_gpt', 'running'].includes(status.state) && !status.threadId) {
+      startJob(await read(join(taskDir(id), 'task.json')));
+    } else if (status.mode === 'codex') {
+      await update(id, { state: 'interrupted', error: '监听器上次退出时任务已启动，请检查会话链接' }, true);
+    }
   }
 
   function noteProgress(id, { stage, summary }) {
@@ -566,6 +684,7 @@ async function serve() {
     let codexReady = false;
     let network;
     const startupFailures = [...(states.get(id)?.startupFailures ?? [])];
+    const startupChecks = [...(states.get(id)?.startupChecks ?? [])];
     function recordStartupFailure(error, attempt) {
       startupFailures.push({ attempt, method: error.rpcMethod, code: error.rpcCode,
         elapsedMs: error.elapsedMs, error: errorText(error), at: stamp() });
@@ -590,9 +709,15 @@ async function serve() {
         }
         if (closing) return;
         ({ network, generation } = checked);
-        await update(id, { network, state: 'starting_gpt', startupAttempt: attempt });
+        await update(id, { network, state: 'starting_gpt', startupAttempt: attempt, startupStep: undefined });
         if (closing) return;
         const codex = execution.codex = new DesktopCodex(codexExecutable, cwd, checked.proxy);
+        codex.on('rpc', (check) => {
+          if (closing || !startupObservedMethods.has(check.method)) return;
+          const step = { ...check, attempt };
+          if (step.state !== 'running') startupChecks.push(step);
+          void update(id, { startupStep: step, startupChecks: startupChecks.slice(-12) }).catch(report);
+        });
         let result;
         try {
           await codex.init();
@@ -612,9 +737,9 @@ async function serve() {
             turnStarted: (turnId) => update(id, { turnId, state: 'running', startedAt: stamp() }, true),
           });
         } catch (error) {
-          if (!startupMethods.has(error.rpcMethod)) throw error;
+          if (!startupObservedMethods.has(error.rpcMethod)) throw error;
           recordStartupFailure(error, attempt);
-          if (closing || attempt > 1 || !startupRetryable(error)) throw error;
+          if (closing || attempt > 1 || !startupMethods.has(error.rpcMethod) || !startupRetryable(error)) throw error;
           closeExecution(execution);
           codexReady = false;
           await update(id, { startupFailures: [...startupFailures], state: 'preparing_network' }, true);
@@ -743,18 +868,7 @@ async function serve() {
   try {
     for (const id of await readdir(jobs)) {
       if (!idPattern.test(id)) continue;
-      const status = await optional(statusPath(id));
-      if (!status) {
-        const job = await read(join(taskDir(id), 'task.json'));
-        startJob(job, { id, source: job.source, ...taskRoute(job) });
-        continue;
-      }
-      if (terminal.includes(status.state)) continue;
-      states.set(id, status);
-      if (['queued', 'preparing_network', 'waiting_network', 'starting_gpt', 'running'].includes(status.state) && !status.threadId) {
-        startJob(await read(join(taskDir(id), 'task.json')));
-      }
-      else if (status.mode === 'codex') await update(id, { state: 'interrupted', error: '监听器上次退出时任务已启动，请检查会话链接' }, true);
+      await restoreJob(id).catch((error) => report(new Error(id + ' ' + errorText(error))));
     }
     inboxWatch = watch(inbox, () => void scan().catch(report));
     resultsWatch = watch(jobs, { recursive: true }, (_event, name) => {
@@ -779,8 +893,7 @@ async function serve() {
     resultsWatch?.close();
     for (const execution of active.values()) closeExecution(execution);
     await Promise.allSettled([...active.values()].map(({ done }) => done));
-    await lock.close();
-    await rm(lockPath, { force: true });
+    await releaseListener();
   }
 }
 
@@ -789,9 +902,10 @@ try {
   const { values: args } = parseArgs({
     args: argv,
     options: Object.fromEntries([
-      ...['source', 'mode', 'title', 'prompt-file', 'id', 'seconds', 'after-progress', 'after-state', 'provider', 'job', 'reply-file', 'chat-link', 'model', 'effort']
+      ...['source', 'mode', 'title', 'prompt-file', 'id', 'seconds', 'after-progress', 'after-state', 'provider', 'job', 'reply-file', 'chat-link', 'model', 'effort', 'state']
         .map((name) => [name, { type: 'string' }]),
       ['input', { type: 'string', multiple: true }],
+      ['check-session', { type: 'boolean' }],
     ]),
   });
   const seconds = Math.min(Math.max(Number(args.seconds) || 25, 1), 300);
@@ -800,9 +914,10 @@ try {
   switch (command) {
     case 'serve': await serve(); break;
     case 'submit': await submit(args); break;
-    case 'status': emit(taskFeedback(await optional(statusPath(args.id)) || await pendingStatus(args.id))); break;
+    case 'status': emit(taskFeedback(await withDeliveryReceipt(await pendingStatus(args.id)))); break;
     case 'quota': emit({ quota: await currentQuota() }); break;
     case 'follow': emit(taskFeedback(await followJob(validId(args.id), seconds))); break;
+    case 'delivery-report': await reportDelivery(args.id, args.source, args.state, args['reply-file']); break;
     case 'wait': {
       const after = args['after-progress'] === undefined ? undefined : Number(args['after-progress']);
       if (after !== undefined && (!Number.isSafeInteger(after) || after < 0)) throw new Error('进度序号必须是非负整数');
@@ -821,21 +936,38 @@ try {
       emit(await new WorkBuddyRecovery(config.workbuddy, join(data, 'workbuddy-check')).dispatch('check'));
       break;
     case 'doctor': {
-      const check = { data, codexExeExists: isAbsolute(codexExecutable) && existsSync(codexExecutable), lock: await optional(join(data, 'listener.lock')) };
-      const app = new DesktopCodex(codexExecutable, root);
-      try { await app.init(); check.codexChatGPTLogin = true; }
-      catch (error) { check.codexChatGPTLogin = false; check.codexError = errorText(error); }
-      finally { app.close(); }
+      const check = {
+        data, codexExeExists: isAbsolute(codexExecutable) && existsSync(codexExecutable), startupChecks: [],
+      };
+      try { check.lock = await optional(join(data, 'listener.lock')); }
+      catch (error) { check.lockError = errorText(error); }
+      const clash = new Clash(config.clash);
+      let route;
       try {
-        const clash = new Clash(config.clash);
+        route = await clash.inspect();
+        check.network = route.network;
         const version = await clash.connect();
         const group = await clash.call('/proxies/' + encodeURIComponent(config.clash.group));
-        check.clash = { version: version.version, group: group.name, latency: await clash.probe() };
+        check.clash = { version: version.version, group: group.name, latency: route.network.latency };
       } catch (error) { check.clash = { error: errorText(error) }; }
+      const app = new DesktopCodex(codexExecutable, root, route?.proxy);
+      app.on('rpc', (step) => { if (step.state !== 'running') check.startupChecks.push(step); });
+      try {
+        await app.init();
+        check.codexChatGPTLogin = true;
+        if (args['check-session']) {
+          await app.checkSession(root);
+          check.sessionCreated = true;
+        }
+      } catch (error) {
+        check.codexChatGPTLogin ??= false;
+        if (args['check-session']) check.sessionCreated = false;
+        check.codexError = errorText(error);
+      } finally { app.close(); }
       emit(check);
       break;
     }
-    default: throw new Error('命令可用 serve、doctor、workbuddy-check、submit、status、wait、follow、quota、knowledge-ask、knowledge-wait、knowledge-next、knowledge-reply、work-report、work-finish');
+    default: throw new Error('命令可用 serve、doctor、workbuddy-check、submit、status、wait、follow、delivery-report、quota、knowledge-ask、knowledge-wait、knowledge-next、knowledge-reply、work-report、work-finish');
   }
 } catch (error) {
   console.error(errorText(error));

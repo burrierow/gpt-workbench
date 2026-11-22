@@ -18,4 +18,6 @@ description: 用GPT。识别 WorkBuddy 任务的固定触发语「用GPT」，�
 5. 当状态为 `completed`，在原手机来路或当前会话直接回复 `text`，并用一次 `present_files` 将该任务 `artifacts` 中的原始绝对路径作为 `files` 提交。支持链接时附 `chatLink`。若附件上传不可用，报告具体文件和渠道限制。失败或中断时回传 `error` 和已有会话链接。重新取回交付时，用同一任务 ID 调用 `follow`。
 6. 在同一条终态回复使用 `follow` 返回的 `quota.fiveHourRemainingPercent` 和 `quota.weeklyRemainingPercent`，按「GPT（Codex）剩余额度 · 5 小时 X% · 一周 Y%」显示。null 显示「暂无法读取」，0 显示 0%。
 
+回传后，用 `delivery-report --id ID --source workbuddy --state submitted` 记录渠道已明确受理文字和应交附件。用户确认收到后，上报 `--state confirmed`。附件准备（`deliveryError`）或回传失败时，把原因写入 UTF-8 文本并用 `--state failed --reply-file "原因文件"` 上报。无法核实渠道是否受理时保持 `pending`。补发时在原会话用同一 ID 调用 `follow`，回传用户还没收到的文字和文件。已确认收到的任务仅在用户要求时补发。
+
 向用户反馈任务 ID 和 `execution` 中的状态、实际模式、是否运行、模型及推理强度。模型和强度为 null 时说「未上报」。心跳表示工作台在线，`execution.running` 为 true 才能确认 Codex 正在跑。收到 `routingNote` 时同时告知请求模式。时间戳以 Z 结尾代表 UTC，向用户显示北京时间时加八小时。

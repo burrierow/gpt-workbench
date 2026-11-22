@@ -29,7 +29,8 @@ export class DesktopCodex extends EventEmitter {
     this.child.on('error', (error) => this.disconnect(error));
     this.child.on('exit', () => this.disconnect(new Error('Codex App Server 已退出')));
     this.child.stdin.on('error', (error) => this.disconnect(error));
-    createInterface({ input: this.child.stdout }).on('line', (line) => {
+    this.lines = createInterface({ input: this.child.stdout });
+    this.lines.on('line', (line) => {
       let message;
       try { message = JSON.parse(line); } catch { return; }
       if (message.method && message.id !== undefined) {
@@ -51,21 +52,33 @@ export class DesktopCodex extends EventEmitter {
     this.child.stdin.write(JSON.stringify(value) + '\n');
   }
 
-  request(method, params = {}, timeout = 25000) {
-    return new Promise((resolve, reject) => {
-      const startedAt = Date.now();
-      const fail = (message, code) => reject(Object.assign(new Error(message), {
-        rpcMethod: method, rpcCode: code, elapsedMs: Date.now() - startedAt,
-      }));
-      if (this.disconnected) { fail(this.disconnected.message); return; }
-      const id = ++this.nextId;
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        fail('Codex 请求超时 ' + method);
-      }, timeout);
-      this.pending.set(id, { resolve, fail, timer });
-      this.send({ id, method, params });
-    });
+  async request(method, params = {}, timeout = 25000, validate) {
+    const startedAt = Date.now();
+    const check = { method, startedAt: new Date(startedAt).toISOString() };
+    this.emit('rpc', { ...check, state: 'running' });
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const fail = (message, code) => reject(Object.assign(new Error(message), { rpcCode: code }));
+        if (this.disconnected) { fail(this.disconnected.message); return; }
+        const id = ++this.nextId;
+        const timer = setTimeout(() => {
+          this.pending.delete(id);
+          fail('Codex 请求超时 ' + method);
+        }, timeout);
+        this.pending.set(id, { resolve, fail, timer });
+        this.send({ id, method, params });
+      });
+      validate?.(result);
+      this.emit('rpc', { ...check, state: 'passed', elapsedMs: Date.now() - startedAt });
+      return result;
+    } catch (error) {
+      Object.assign(error, { rpcMethod: method, elapsedMs: Date.now() - startedAt });
+      this.emit('rpc', {
+        ...check, state: 'failed', elapsedMs: error.elapsedMs, code: error.rpcCode,
+        error: error.message.slice(0, 1500),
+      });
+      throw error;
+    }
   }
 
   disconnect(error) {
@@ -80,8 +93,11 @@ export class DesktopCodex extends EventEmitter {
   }
 
   close() {
-    this.child.stdin.end();
-    this.child.kill();
+    this.lines.close();
+    this.child.stdin.destroy();
+    this.child.stdout.destroy();
+    if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill();
+    this.child.unref();
   }
 
   async init(timeout) {
@@ -89,8 +105,15 @@ export class DesktopCodex extends EventEmitter {
       clientInfo: { name: 'gpt_workbench', title: 'GPT 工作台', version: '1.0.0' },
     }, timeout);
     this.send({ method: 'initialized' });
-    const { account } = await this.request('account/read', { refreshToken: false }, timeout);
-    if (account?.type !== 'chatgpt') throw new Error('Codex App Server 需要 ChatGPT 帐号登录');
+    await this.request('account/read', { refreshToken: false }, timeout, ({ account }) => {
+      if (account?.type !== 'chatgpt') throw new Error('Codex App Server 需要 ChatGPT 帐号登录');
+    });
+  }
+
+  async checkSession(cwd, timeout) {
+    await this.request('thread/start', {
+      cwd, modelProvider: 'openai', sandbox: 'workspace-write', approvalPolicy: 'never', ephemeral: true,
+    }, timeout);
   }
 
   async readQuota() {
@@ -116,11 +139,12 @@ export class DesktopCodex extends EventEmitter {
     const { thread, model: actualModel, reasoningEffort } = await this.request('thread/start', {
       cwd, modelProvider: 'openai', sandbox: 'workspace-write', approvalPolicy: 'never', ephemeral: false,
       model, config: { model_reasoning_effort: effort },
+    }, undefined, ({ model: actualModel, reasoningEffort }) => {
+      if (actualModel !== model || reasoningEffort !== effort) {
+        throw new Error(`Codex 未应用请求的模型或推理强度：${actualModel} / ${reasoningEffort}`);
+      }
     });
     const threadId = thread.id;
-    if (actualModel !== model || reasoningEffort !== effort) {
-      throw new Error(`Codex 未应用请求的模型或推理强度：${actualModel} / ${reasoningEffort}`);
-    }
     await started(threadId, { model: actualModel, reasoningEffort });
     let resolveTurn;
     let rejectTurn;

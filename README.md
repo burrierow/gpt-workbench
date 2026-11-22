@@ -60,3 +60,9 @@ node ./workbench.mjs status --id '<任务 ID>'
 ```
 
 `doctor` 检查 ChatGPT 登录、监听器和当前 Clash 连接。`workbuddy-check` 请 WorkBuddy 执行一次只读代理检查，可验证本地派单路径。安装 Kimi Work 本地插件后，若应用已在运行，重启应用以加载插件。也可从 Kimi Work 的「技能」页上传本目录下的 Kimi `SKILL.md`。参见 [Kimi 技能导入说明](https://www.kimi.com/features/skills)。
+
+运行 `node ./workbench.mjs doctor --check-session` 可通过任务使用的代理检查创建临时 Codex 会话。诊断分别返回线路探测、登录和会话检查。任务状态的 `startupStep` 和 `startupChecks` 会记录初始化、登录、创建会话和开工确认各步骤的状态与耗时。监听器重启时会恢复已经落盘的结果，并保留已经开工的任务会话链接。
+
+跨渠道回传后，由原渠道运行 `node ./workbench.mjs delivery-report --id ID --source workbuddy --state submitted`。Kimi 使用 `--source kimi`。渠道明确受理后可记为 `submitted`，用户确认收到后记为 `confirmed`，准备或发送失败记为 `failed` 并通过 `--reply-file` 提供原因。没有可核实的回执时显示 `pending`。用 `status` 查询回传状态，用原 ID 重新调用 `follow` 取出原成品补发。
+
+周报试用的任务文案、虚构附件和记录方法见 [周报试用](周报试用.md)。
