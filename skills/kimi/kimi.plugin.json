@@ -1,6 +1,6 @@
 {
   "name": "gpt-workbench-kimi",
-  "version": "1.0.10",
+  "version": "1.4.0",
   "description": "将明确交给 GPT 的任务转发到本机工作台，并接收结果和知识查询。",
   "skills": "./skills/",
   "sessionStart": {
@@ -8,6 +8,6 @@
   },
   "interface": {
     "displayName": "GPT 工作台",
-    "shortDescription": "用GPT 自动派单并收取结果，GPT 大小写不限"
+    "shortDescription": "明确派单并收取 GPT 原始答复与产物"
   }
 }

@@ -70,7 +70,7 @@ export class Clash {
     const proxy = 'http://127.0.0.1:' + this.mixedPort;
     try {
       const { stdout } = await exec('curl.exe', [
-        '-sS', '--noproxy', '', '--proxy', proxy, '--max-time', '4', '-o', 'NUL',
+        '-q', '-sS', '--noproxy', '', '--proxy', proxy, '--max-time', '4', '-o', 'NUL',
         '-w', '%{http_code} %{time_total}', this.config.probeUrl,
       ], { windowsHide: true, timeout: 4700 });
       const [code, seconds] = stdout.trim().split(/\s+/).map(Number);

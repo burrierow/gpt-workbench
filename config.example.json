@@ -1,8 +1,9 @@
 {
-  "dataDir": "C:/path/to/gpt-workbench/data",
-  "codexExe": "C:/path/to/codex.exe",
+  "dataDir": "",
+  "codexExe": "",
   "taskTimeoutMinutes": 90,
   "kimiTaskRoot": "",
+  "kimiImaLibrary": "",
   "historySectionId": "",
   "workbuddy": {
     "exe": "C:\\Program Files\\WorkBuddy\\WorkBuddy.exe",
@@ -12,7 +13,7 @@
   "clash": {
     "exe": "C:\\Program Files\\Clash Verge\\clash-verge.exe",
     "profile": "C:/path/to/clash-verge.yaml",
-    "group": "🧲 AI",
+    "group": "Example Selector",
     "probeUrl": "https://chatgpt.com/backend-api/wham/accounts/check",
     "probeStatus": 401,
     "slowMs": 2000,

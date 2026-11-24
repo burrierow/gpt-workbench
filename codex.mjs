@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
 
+let historyPlacement = Promise.resolve();
+
 const publicToolStages = {
   webSearch: ['research', '正在查找公开资料', '已完成一轮资料检索'],
   commandExecution: ['tools', '正在运行本地工具', '已完成一次本地工具调用'],
@@ -36,7 +38,9 @@ export class DesktopCodex extends EventEmitter {
       if (message.method && message.id !== undefined) {
         this.send({ id: message.id, error: { code: -32601, message: 'This bridge cannot acknowledge interactive requests.' } });
       } else if (message.method) {
-        this.emit(message.method, message.params);
+        // App-server error notifications can describe retries. EventEmitter reserves `error` for process errors.
+        const notification = message.method === 'error' ? 'codex-error-notification' : message.method;
+        this.emit(notification, message.params);
       } else {
         const waiter = this.pending.get(message.id);
         if (!waiter) return;
@@ -102,7 +106,7 @@ export class DesktopCodex extends EventEmitter {
 
   async init(timeout) {
     await this.request('initialize', {
-      clientInfo: { name: 'gpt_workbench', title: 'GPT 工作台', version: '1.0.0' },
+      clientInfo: { name: 'gpt_workbench', title: 'GPT 工作台', version: '1.4.0' },
     }, timeout);
     this.send({ method: 'initialized' });
     await this.request('account/read', { refreshToken: false }, timeout, ({ account }) => {
@@ -135,25 +139,55 @@ export class DesktopCodex extends EventEmitter {
     }
   }
 
-  async run({ cwd, title, prompt, timeout, model, effort, historySectionId, started, turnStarted, progress = () => {} }) {
-    const { thread, model: actualModel, reasoningEffort } = await this.request('thread/start', {
-      cwd, modelProvider: 'openai', sandbox: 'workspace-write', approvalPolicy: 'never', ephemeral: false,
+  async placeInHistory(thread, sectionId) {
+    let cursor;
+    do {
+      const page = await this.request('thread/list', {
+        sectionId, cursor, sortKey: 'section_position', sortDirection: 'asc',
+        limit: 50, useStateDbOnly: true, currentAccountOnly: true,
+      }, 4000);
+      const before = page.data.find((item) => item.id !== thread.id && (
+        item.createdAt < thread.createdAt || (item.createdAt === thread.createdAt && item.id < thread.id)
+      ));
+      if (before || !page.nextCursor) {
+        await this.request('thread/section/move', {
+          threadId: thread.id, sectionId, beforeThreadId: before?.id,
+        }, 4000);
+        return;
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
+  }
+
+  async run({ cwd, prompt, timeout, model, effort, historySectionId, diagnostic = false,
+    resumeThreadId, persistent = false, beforeTurn = async () => {},
+    started, turnStarted, progress = () => {}, activity = () => {}, signal }) {
+    signal?.throwIfAborted();
+    const { thread, model: actualModel, reasoningEffort } = await this.request(
+      resumeThreadId ? 'thread/resume' : 'thread/start', {
+      cwd, modelProvider: 'openai', sandbox: 'workspace-write', approvalPolicy: 'never',
+      ...(resumeThreadId ? { threadId: resumeThreadId, excludeTurns: true } : { ephemeral: diagnostic && !persistent }),
       model, config: { model_reasoning_effort: effort },
     }, undefined, ({ model: actualModel, reasoningEffort }) => {
       if (actualModel !== model || reasoningEffort !== effort) {
         throw new Error(`Codex 未应用请求的模型或推理强度：${actualModel} / ${reasoningEffort}`);
       }
     });
+    signal?.throwIfAborted();
     const threadId = thread.id;
+    if (resumeThreadId && threadId !== resumeThreadId) throw new Error('Codex 返回了不同的会话 ID');
+    if (resumeThreadId && thread.status?.type === 'active') throw new Error('原 GPT 会话仍有回合正在执行，请稍后重试');
     await started(threadId, { model: actualModel, reasoningEffort });
     let resolveTurn;
     let rejectTurn;
     const completed = new Promise((resolve, reject) => { resolveTurn = resolve; rejectTurn = reject; });
     completed.catch(() => {});
-    let latest = '';
-    let final = '';
+    let turnId;
+    const earlyCompletions = new Map();
+    const answers = new Map();
+    const matchesTurn = (event) => event.threadId === threadId && (!turnId || event.turnId === turnId);
     const toolProgress = (event, finished) => {
-      if (event.threadId !== threadId || !Object.hasOwn(publicToolStages, event.item?.type)) return;
+      if (!matchesTurn(event) || !Object.hasOwn(publicToolStages, event.item?.type)) return;
       const [stage, begin, end] = publicToolStages[event.item.type];
       if (finished && ['failed', 'declined', 'interrupted'].includes(event.item.status)) {
         progress({ stage, summary: '一次工具调用未成功，GPT 正在处理' });
@@ -161,21 +195,33 @@ export class DesktopCodex extends EventEmitter {
         progress({ stage, summary: finished ? end : begin });
       }
     };
-    const onItemStarted = (event) => toolProgress(event, false);
+    const onItemStarted = (event) => {
+      if (matchesTurn(event) && Object.hasOwn(publicToolStages, event.item?.type)) activity();
+      toolProgress(event, false);
+    };
+    const onOutput = (event) => {
+      if (matchesTurn(event) && event.delta?.trim()) activity();
+    };
+    const outputEvents = ['item/agentMessage/delta', 'item/commandExecution/outputDelta', 'item/fileChange/outputDelta'];
     const onItem = (event) => {
       const item = event.item;
-      if (event.threadId !== threadId) return;
+      if (!matchesTurn(event)) return;
+      if (Object.hasOwn(publicToolStages, item.type) || (item.type === 'agentMessage' && item.text?.trim())) activity();
       toolProgress(event, true);
       if (item.type !== 'agentMessage') return;
       if (item.phase === 'commentary') {
         const summary = summaryText(item.text);
         if (summary) progress({ stage: 'update', summary });
       }
-      if (item.phase === 'final_answer') final = item.text;
-      if (item.phase !== 'commentary') latest = item.text;
+      if (item.phase !== 'commentary') {
+        const answer = answers.get(event.turnId) ?? {};
+        answer.latest = item.text;
+        if (item.phase === 'final_answer') answer.final = item.text;
+        answers.set(event.turnId, answer);
+      }
     };
     const onPlan = (event) => {
-      if (event.threadId !== threadId || !Array.isArray(event.plan)) return;
+      if (!matchesTurn(event) || !Array.isArray(event.plan)) return;
       const done = event.plan.filter((entry) => entry.status === 'completed').length;
       const current = event.plan.find((entry) => entry.status === 'inProgress');
       const next = current ?? event.plan.find((entry) => entry.status === 'pending');
@@ -184,36 +230,52 @@ export class DesktopCodex extends EventEmitter {
         (step ? (current ? '，正在处理 ' : '，下一步 ') + step : '') });
     };
     const onTurn = (event) => {
-      if (event.threadId === threadId) resolveTurn(event.turn);
+      if (event.threadId !== threadId) return;
+      if (!turnId) earlyCompletions.set(event.turn.id, event.turn);
+      else if (event.turn.id === turnId) resolveTurn(event.turn);
+    };
+    const onCodexError = (event) => {
+      if (event?.threadId === threadId && event.willRetry) {
+        progress({ stage: 'update', summary: 'GPT 连接暂时中断，正在重连', transient: true });
+      }
     };
     this.on('item/started', onItemStarted);
     this.on('item/completed', onItem);
+    for (const name of outputEvents) this.on(name, onOutput);
     this.on('turn/plan/updated', onPlan);
     this.on('turn/completed', onTurn);
+    this.on('codex-error-notification', onCodexError);
     this.once('disconnect', rejectTurn);
+    let onAbort;
+    const interrupted = new Promise((_, reject) => { onAbort = () => reject(signal.reason); });
+    interrupted.catch(() => {});
+    signal?.addEventListener('abort', onAbort, { once: true });
     const timer = setTimeout(() => rejectTurn(new Error('GPT 任务执行超时')), timeout);
-    let turnId;
     try {
+      signal?.throwIfAborted();
+      await beforeTurn();
+      signal?.throwIfAborted();
       const response = await this.request('turn/start', {
-        threadId, input: [{ type: 'text', text: prompt, text_elements: [] }],
+        threadId, cwd, input: [{ type: 'text', text: prompt, text_elements: [] }],
       });
       turnId = response.turn.id;
+      if (earlyCompletions.has(turnId)) resolveTurn(earlyCompletions.get(turnId));
+      signal?.throwIfAborted();
       await turnStarted(turnId);
-      // Name after the first turn has initialized its persistent history.
-      await this.request('thread/name/set', { threadId, name: title }, 4000).catch(() => {});
-      if (historySectionId) {
-        await this.request('thread/section/move', {
-          threadId, sectionId: historySectionId,
-        }, 4000).catch((error) => {
+      if (!resumeThreadId && !diagnostic && historySectionId) {
+        historyPlacement = historyPlacement.then(() => {
+          if (!signal?.aborted) return this.placeInHistory(thread, historySectionId);
+        }).catch((error) => {
           console.warn('工作台会话分组失败', threadId, error.message);
         });
+        await Promise.race([historyPlacement, interrupted]);
       }
-      const turn = await completed;
+      const turn = await Promise.race([completed, interrupted]);
+      signal?.throwIfAborted();
       if (turn.status !== 'completed') throw new Error(turn.error?.message || 'GPT 状态 ' + turn.status);
-      if (!final && !latest) {
-        latest = turn.items?.filter((item) => item.type === 'agentMessage' && item.phase !== 'commentary').at(-1)?.text;
-      }
-      return { threadId, turnId, text: final || latest || '' };
+      const answer = answers.get(turnId);
+      const fallback = turn.items?.filter((item) => item.type === 'agentMessage' && item.phase !== 'commentary').at(-1)?.text;
+      return { threadId, turnId, text: answer?.final || answer?.latest || fallback || '' };
     } catch (error) {
       if (turnId) await this.request('turn/interrupt', { threadId, turnId }, 4000).catch(() => {});
       throw error;
@@ -221,9 +283,12 @@ export class DesktopCodex extends EventEmitter {
       clearTimeout(timer);
       this.off('item/started', onItemStarted);
       this.off('item/completed', onItem);
+      for (const name of outputEvents) this.off(name, onOutput);
       this.off('turn/plan/updated', onPlan);
       this.off('turn/completed', onTurn);
+      this.off('codex-error-notification', onCodexError);
       this.off('disconnect', rejectTurn);
+      signal?.removeEventListener('abort', onAbort);
     }
   }
 }

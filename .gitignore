@@ -1,5 +1,9 @@
 config.json
+skill-targets.json
 data/
+dist/
+.upgrade-backup*/
+*.sqlite*
 .env
 *.log
 __pycache__/

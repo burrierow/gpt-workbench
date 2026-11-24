@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "gpt-workbench": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["C:/path/to/GPT-Workbench/qwenwork-mcp.mjs"]
+    }
+  }
+}
